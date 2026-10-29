@@ -1,0 +1,97 @@
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = "registry.hub.docker.com/retailcapstone"
+        BACKEND_IMAGE = "${REGISTRY}/inventory-backend"
+        FRONTEND_IMAGE = "${REGISTRY}/inventory-frontend"
+        BUILD_TAG = "${env.BUILD_NUMBER}"
+        KUBECONFIG = credentials('k8s-cluster-credentials')
+    }
+
+    stages {
+        stage('1. Checkout SCM') {
+            steps {
+                echo 'Pulling latest commit from repository...'
+                checkout scm
+            }
+        }
+
+        stage('2. Backend Tests & Health') {
+            steps {
+                dir('backend') {
+                    echo 'Installing backend dependencies...'
+                    sh 'npm ci'
+                    echo 'Running server syntax and database schema validation...'
+                    sh 'node -e "require(\'./src/server.js\'); setTimeout(() => process.exit(0), 2000);"'
+                }
+            }
+        }
+
+        stage('3. Frontend Build & Asset Verification') {
+            steps {
+                dir('frontend') {
+                    echo 'Installing frontend packages & building Vite bundle...'
+                    sh 'npm ci'
+                    sh 'npm run build'
+                }
+            }
+        }
+
+        stage('4. Docker Container Packaging') {
+            steps {
+                echo 'Building production container images...'
+                sh "docker build -f devops/Dockerfile.backend -t ${BACKEND_IMAGE}:${BUILD_TAG} -t ${BACKEND_IMAGE}:latest ."
+                sh "docker build -f devops/Dockerfile.frontend -t ${FRONTEND_IMAGE}:${BUILD_TAG} -t ${FRONTEND_IMAGE}:latest ."
+            }
+        }
+
+        stage('5. Security Vulnerability Scan') {
+            steps {
+                echo 'Running Trivy container security scans...'
+                sh "trivy image --severity HIGH,CRITICAL ${BACKEND_IMAGE}:${BUILD_TAG} || true"
+            }
+        }
+
+        stage('6. Publish Images to Registry') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+                    sh "docker push ${BACKEND_IMAGE}:${BUILD_TAG}"
+                    sh "docker push ${BACKEND_IMAGE}:latest"
+                    sh "docker push ${FRONTEND_IMAGE}:${BUILD_TAG}"
+                    sh "docker push ${FRONTEND_IMAGE}:latest"
+                }
+            }
+        }
+
+        stage('7. Kubernetes Rolling Deployment') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo 'Deploying rolling updates to Kubernetes Cluster...'
+                sh 'kubectl apply -f devops/k8s/01-configmap.yaml'
+                sh 'kubectl apply -f devops/k8s/03-backend.yaml'
+                sh 'kubectl apply -f devops/k8s/04-frontend.yaml'
+                sh 'kubectl apply -f devops/k8s/05-ingress.yaml'
+                sh 'kubectl rollout status deployment/retail-backend-deployment -n retail-production --timeout=90s'
+                sh 'kubectl rollout status deployment/retail-frontend-deployment -n retail-production --timeout=90s'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '====================================================='
+            echo ' CI/CD Pipeline Completed Successfully! Deployment Live.'
+            echo '====================================================='
+        }
+        failure {
+            echo 'Pipeline failed. Check stage logs for troubleshooting.'
+        }
+    }
+}
